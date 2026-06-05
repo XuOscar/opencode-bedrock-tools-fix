@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "description": "OpenCode plugin that fixes the LiteLLM->AWS Bedrock 'tools= param' UnsupportedParamsError during conversation compaction by injecting a harmless no-op tool into requests that have tool-call history but an empty tools array.",
   "type": "module",
-  "main": "index.ts",
+  "main": "index.js",
   "exports": {
-    ".": "./index.ts"
+    ".": "./index.js"
   },
   "files": [
+    "index.js",
     "index.ts",
     "README.md",
     "LICENSE"

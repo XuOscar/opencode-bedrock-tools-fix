@@ -32,8 +32,5 @@
   "bugs": {
     "url": "https://github.com/XuOscar/opencode-bedrock-tools-fix/issues"
   },
-  "homepage": "https://github.com/XuOscar/opencode-bedrock-tools-fix#readme",
-  "peerDependencies": {
-    "@opencode-ai/plugin": "*"
-  }
+  "homepage": "https://github.com/XuOscar/opencode-bedrock-tools-fix#readme"
 }

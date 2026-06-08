@@ -37,33 +37,26 @@ function hasToolHistory(body) {
 function toolsEmpty(body) {
   return !Array.isArray(body?.tools) || body.tools.length === 0;
 }
-function describeMsg(m) {
-  if (!m)
-    return "null";
-  const role = m.role ?? "?";
-  let shape = "";
-  if (typeof m.content === "string") {
-    shape = `content:string(len=${m.content.length}${m.content.trim() === "" ? ",EMPTY" : ""})`;
-  } else if (Array.isArray(m.content)) {
-    const types = m.content.map((p) => p?.type ?? "?").join("+");
-    shape = `content:[${types || "EMPTY"}]`;
-  } else if (m.content == null) {
-    shape = "content:null";
-  } else {
-    shape = `content:${typeof m.content}`;
-  }
-  const tc = Array.isArray(m.tool_calls) && m.tool_calls.length > 0 ? `,tool_calls=${m.tool_calls.length}` : "";
-  return `${role}{${shape}${tc}}`;
+function isAssistant(m) {
+  return m && m.role === "assistant";
 }
-function probeTrailing(body) {
-  if (!body || !Array.isArray(body.messages) || body.messages.length === 0) {
-    return null;
+function hasToolCalls(m) {
+  if (Array.isArray(m?.tool_calls) && m.tool_calls.length > 0)
+    return true;
+  if (Array.isArray(m?.content)) {
+    return m.content.some((p) => p && p.type === "tool_use");
   }
-  const msgs = body.messages;
-  const last = msgs[msgs.length - 1];
-  const prev = msgs.length >= 2 ? msgs[msgs.length - 2] : undefined;
-  const endsWithAssistant = last?.role === "assistant";
-  return `tail: prev=${prev ? describeMsg(prev) : "-"} | last=${describeMsg(last)} | ` + `PREFILL_RISK=${endsWithAssistant}`;
+  return false;
+}
+function stripTrailingPrefill(body) {
+  if (!body || !Array.isArray(body.messages))
+    return 0;
+  let stripped = 0;
+  while (body.messages.length > 0 && isAssistant(body.messages[body.messages.length - 1]) && !hasToolCalls(body.messages[body.messages.length - 1])) {
+    body.messages.pop();
+    stripped++;
+  }
+  return stripped;
 }
 var NOOP_TOOL = {
   type: "function",
@@ -90,15 +83,21 @@ var plugin = async (_input, options) => {
           } catch {
             body = undefined;
           }
-          if (body && hasToolHistory(body) && toolsEmpty(body)) {
-            body.tools = [NOOP_TOOL];
-            init = { ...init, body: JSON.stringify(body) };
-            log(`[${providerID2}] PATCHED: injected noop tool (model=${body.model ?? "?"}, messages=${Array.isArray(body.messages) ? body.messages.length : "?"})`);
-          }
-          if (body && debug) {
-            const t = probeTrailing(body);
-            if (t)
-              log(`[${providerID2}] ${t}`);
+          if (body) {
+            let changed = false;
+            const strippedCount = stripTrailingPrefill(body);
+            if (strippedCount > 0) {
+              changed = true;
+              log(`[${providerID2}] PREFILL-FIX: stripped ${strippedCount} trailing assistant message(s) (model=${body.model ?? "?"}, messages now=${Array.isArray(body.messages) ? body.messages.length : "?"})`);
+            }
+            if (hasToolHistory(body) && toolsEmpty(body)) {
+              body.tools = [NOOP_TOOL];
+              changed = true;
+              log(`[${providerID2}] TOOLS-FIX: injected noop tool (model=${body.model ?? "?"}, messages=${Array.isArray(body.messages) ? body.messages.length : "?"})`);
+            }
+            if (changed) {
+              init = { ...init, body: JSON.stringify(body) };
+            }
           }
         }
       } catch (e) {
@@ -135,7 +134,7 @@ var plugin = async (_input, options) => {
     }
   };
 };
-var repo7_default = plugin;
+var repo8_default = plugin;
 export {
-  repo7_default as default
+  repo8_default as default
 };

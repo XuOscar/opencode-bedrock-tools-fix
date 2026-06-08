@@ -1,32 +1,33 @@
 /**
  * opencode-bedrock-tools-fix
  * ---------------------------------------------------------------------------
- * Fixes the LiteLLM -> AWS Bedrock error that OpenCode hits during conversation
- * compaction (and any request that carries tool-call history but sends an empty
- * `tools` array):
+ * Client-side fixes for two OpenCode issues that hit Claude models served
+ * through a LiteLLM -> AWS Bedrock gateway via the @ai-sdk/openai-compatible
+ * transport (where OpenCode's own normalizers don't apply):
  *
- *   litellm.UnsupportedParamsError: Bedrock doesn't support tool calling
- *   without `tools=` param specified.
+ *   #1 UnsupportedParamsError: "Bedrock doesn't support tool calling without
+ *      `tools=` param specified." — happens on compaction / any request with
+ *      tool-call history but an empty tools array.
+ *
+ *   #2 "This model does not support assistant message prefill. The
+ *      conversation must end with a user message." — Claude Opus 4.6+ rejects
+ *      requests whose messages array ends with an assistant message. Often
+ *      surfaces only as "terminated" because the 400 has an empty streamed body.
  *
  * HOW IT WORKS
  * ------------
- * OpenCode's compaction request includes the conversation history (which
- * contains tool_use / tool_result blocks) but sends `tools: {}` (empty). Strict
- * LiteLLM -> Bedrock gateways reject this. This plugin registers a custom
- * `fetch` (via the auth.loader mechanism that OpenCode's own built-in providers
- * use) for the configured provider(s). When it sees an outgoing POST whose body
- * has tool-call history but an empty/missing `tools` array, it injects a single
- * harmless no-op placeholder tool so the request passes validation.
- *
- * It does NOT set `tool_choice`: Bedrock's ToolChoice union only supports
- * auto/any/tool (no "none"), and sending "none" makes LiteLLM raise a *new* 400
- * unless the proxy runs with drop_params=true. Omitting tool_choice lets Bedrock
- * default to "auto", which still permits normal text output. The placeholder
- * tool's description instructs the model never to call it (the same approach as
- * opencode's own merged fix, PR #18539), so summaries stay intact.
+ * The plugin registers a custom `fetch` for the configured provider(s) via the
+ * auth.loader mechanism OpenCode's built-in providers use. On every outgoing
+ * POST it:
+ *   - strips trailing prefill assistant message(s) (no tool_calls) so the
+ *     conversation ends on a non-assistant message (fix #2); and
+ *   - injects a harmless noop tool when there is tool-call history but an empty
+ *     tools array (fix #1).
+ * Assistant turns that carry tool calls are never stripped. It does NOT set
+ * tool_choice (Bedrock has no "none"; that would cause a new 400). Normal
+ * requests pass through untouched.
  *
  * Cross-platform: uses only node:fs / node:os / node:path and standard fetch.
- * Works on Windows, macOS, and Linux with no changes.
  *
  * CONFIG (in opencode.json):
  *   "plugin": [
@@ -87,50 +88,52 @@ function toolsEmpty(body: any): boolean {
 }
 
 /**
- * PROBE for issue #3 (assistant message prefill / "terminated").
- * Claude Opus 4.6+ rejects requests whose messages array ends with an
- * assistant message ("The conversation must end with a user message").
- * OpenCode strips trailing assistants only for @ai-sdk/anthropic and
- * @ai-sdk/amazon-bedrock, NOT for @ai-sdk/openai-compatible gateways — so it
- * never runs for this provider. Before writing the strip logic, we log the
- * exact shape of the trailing message(s) to avoid wrongly removing a valid
- * assistant turn that carries tool_calls.
+ * Fix for issue #3 (assistant message prefill / "terminated").
  *
- * This function ONLY describes; it does not modify the request.
+ * Claude Opus 4.6+ rejects requests whose messages array ends with an
+ * assistant message: "This model does not support assistant message prefill.
+ * The conversation must end with a user message." OpenCode strips trailing
+ * assistants only for @ai-sdk/anthropic and @ai-sdk/amazon-bedrock, NOT for
+ * @ai-sdk/openai-compatible gateways — so the fix never runs for such
+ * providers and the request fails (often surfacing only as "terminated"
+ * because the 400 is returned with an empty streamed body).
+ *
+ * We replicate OpenCode's stripTrailingAssistant() client-side: remove any
+ * trailing assistant message(s) that are pure prefill, i.e. that do NOT carry
+ * tool calls. An assistant message WITH tool_calls is a legitimate tool-use
+ * turn (its tool results follow) and must never be stripped.
  */
-function describeMsg(m: any): string {
-  if (!m) return "null"
-  const role = m.role ?? "?"
-  let shape = ""
-  if (typeof m.content === "string") {
-    shape = `content:string(len=${m.content.length}${m.content.trim() === "" ? ",EMPTY" : ""})`
-  } else if (Array.isArray(m.content)) {
-    const types = m.content.map((p: any) => p?.type ?? "?").join("+")
-    shape = `content:[${types || "EMPTY"}]`
-  } else if (m.content == null) {
-    shape = "content:null"
-  } else {
-    shape = `content:${typeof m.content}`
-  }
-  const tc =
-    Array.isArray(m.tool_calls) && m.tool_calls.length > 0
-      ? `,tool_calls=${m.tool_calls.length}`
-      : ""
-  return `${role}{${shape}${tc}}`
+function isAssistant(m: any): boolean {
+  return m && m.role === "assistant"
 }
 
-function probeTrailing(body: any): string | null {
-  if (!body || !Array.isArray(body.messages) || body.messages.length === 0) {
-    return null
+function hasToolCalls(m: any): boolean {
+  // OpenAI-style tool_calls
+  if (Array.isArray(m?.tool_calls) && m.tool_calls.length > 0) return true
+  // Anthropic-style content blocks
+  if (Array.isArray(m?.content)) {
+    return m.content.some((p: any) => p && p.type === "tool_use")
   }
-  const msgs = body.messages
-  const last = msgs[msgs.length - 1]
-  const prev = msgs.length >= 2 ? msgs[msgs.length - 2] : undefined
-  const endsWithAssistant = last?.role === "assistant"
-  return (
-    `tail: prev=${prev ? describeMsg(prev) : "-"} | last=${describeMsg(last)} | ` +
-    `PREFILL_RISK=${endsWithAssistant}`
-  )
+  return false
+}
+
+/**
+ * Removes trailing prefill assistant messages (assistant turns with no tool
+ * calls) so the conversation ends on a non-assistant message. Returns the
+ * number of messages stripped. Mutates body.messages in place.
+ */
+function stripTrailingPrefill(body: any): number {
+  if (!body || !Array.isArray(body.messages)) return 0
+  let stripped = 0
+  while (
+    body.messages.length > 0 &&
+    isAssistant(body.messages[body.messages.length - 1]) &&
+    !hasToolCalls(body.messages[body.messages.length - 1])
+  ) {
+    body.messages.pop()
+    stripped++
+  }
+  return stripped
 }
 
 // OpenAI-compatible (chat/completions) placeholder tool. The description tells
@@ -173,22 +176,41 @@ const plugin: Plugin = async (_input, options?: Record<string, unknown>) => {
           } catch {
             body = undefined
           }
-          if (body && hasToolHistory(body) && toolsEmpty(body)) {
-            body.tools = [NOOP_TOOL]
-            // Intentionally NOT setting tool_choice (see header comment).
-            init = { ...init, body: JSON.stringify(body) }
-            log(
-              `[${providerID}] PATCHED: injected noop tool (model=${
-                body.model ?? "?"
-              }, messages=${
-                Array.isArray(body.messages) ? body.messages.length : "?"
-              })`,
-            )
-          }
-          // PROBE #3 (prefill): describe trailing message shape, do NOT modify.
-          if (body && debug) {
-            const t = probeTrailing(body)
-            if (t) log(`[${providerID}] ${t}`)
+          if (body) {
+            let changed = false
+
+            // Fix #3: strip trailing prefill assistant message(s) so the
+            // conversation ends on a non-assistant message (Claude Opus 4.6+
+            // rejects assistant-prefill). Tool-call assistant turns are kept.
+            const strippedCount = stripTrailingPrefill(body)
+            if (strippedCount > 0) {
+              changed = true
+              log(
+                `[${providerID}] PREFILL-FIX: stripped ${strippedCount} trailing assistant message(s) (model=${
+                  body.model ?? "?"
+                }, messages now=${
+                  Array.isArray(body.messages) ? body.messages.length : "?"
+                })`,
+              )
+            }
+
+            // Fix #1: if there is tool-call history but an empty tools array,
+            // inject a harmless noop tool so the gateway accepts the request.
+            if (hasToolHistory(body) && toolsEmpty(body)) {
+              body.tools = [NOOP_TOOL]
+              changed = true
+              log(
+                `[${providerID}] TOOLS-FIX: injected noop tool (model=${
+                  body.model ?? "?"
+                }, messages=${
+                  Array.isArray(body.messages) ? body.messages.length : "?"
+                })`,
+              )
+            }
+
+            if (changed) {
+              init = { ...init, body: JSON.stringify(body) }
+            }
           }
         }
       } catch (e) {

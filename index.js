@@ -37,6 +37,34 @@ function hasToolHistory(body) {
 function toolsEmpty(body) {
   return !Array.isArray(body?.tools) || body.tools.length === 0;
 }
+function describeMsg(m) {
+  if (!m)
+    return "null";
+  const role = m.role ?? "?";
+  let shape = "";
+  if (typeof m.content === "string") {
+    shape = `content:string(len=${m.content.length}${m.content.trim() === "" ? ",EMPTY" : ""})`;
+  } else if (Array.isArray(m.content)) {
+    const types = m.content.map((p) => p?.type ?? "?").join("+");
+    shape = `content:[${types || "EMPTY"}]`;
+  } else if (m.content == null) {
+    shape = "content:null";
+  } else {
+    shape = `content:${typeof m.content}`;
+  }
+  const tc = Array.isArray(m.tool_calls) && m.tool_calls.length > 0 ? `,tool_calls=${m.tool_calls.length}` : "";
+  return `${role}{${shape}${tc}}`;
+}
+function probeTrailing(body) {
+  if (!body || !Array.isArray(body.messages) || body.messages.length === 0) {
+    return null;
+  }
+  const msgs = body.messages;
+  const last = msgs[msgs.length - 1];
+  const prev = msgs.length >= 2 ? msgs[msgs.length - 2] : undefined;
+  const endsWithAssistant = last?.role === "assistant";
+  return `tail: prev=${prev ? describeMsg(prev) : "-"} | last=${describeMsg(last)} | ` + `PREFILL_RISK=${endsWithAssistant}`;
+}
 var NOOP_TOOL = {
   type: "function",
   function: {
@@ -66,6 +94,11 @@ var plugin = async (_input, options) => {
             body.tools = [NOOP_TOOL];
             init = { ...init, body: JSON.stringify(body) };
             log(`[${providerID2}] PATCHED: injected noop tool (model=${body.model ?? "?"}, messages=${Array.isArray(body.messages) ? body.messages.length : "?"})`);
+          }
+          if (body && debug) {
+            const t = probeTrailing(body);
+            if (t)
+              log(`[${providerID2}] ${t}`);
           }
         }
       } catch (e) {
@@ -102,7 +135,7 @@ var plugin = async (_input, options) => {
     }
   };
 };
-var repo2_default = plugin;
+var repo7_default = plugin;
 export {
-  repo2_default as default
+  repo7_default as default
 };

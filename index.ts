@@ -86,6 +86,53 @@ function toolsEmpty(body: any): boolean {
   return !Array.isArray(body?.tools) || body.tools.length === 0
 }
 
+/**
+ * PROBE for issue #3 (assistant message prefill / "terminated").
+ * Claude Opus 4.6+ rejects requests whose messages array ends with an
+ * assistant message ("The conversation must end with a user message").
+ * OpenCode strips trailing assistants only for @ai-sdk/anthropic and
+ * @ai-sdk/amazon-bedrock, NOT for @ai-sdk/openai-compatible gateways — so it
+ * never runs for this provider. Before writing the strip logic, we log the
+ * exact shape of the trailing message(s) to avoid wrongly removing a valid
+ * assistant turn that carries tool_calls.
+ *
+ * This function ONLY describes; it does not modify the request.
+ */
+function describeMsg(m: any): string {
+  if (!m) return "null"
+  const role = m.role ?? "?"
+  let shape = ""
+  if (typeof m.content === "string") {
+    shape = `content:string(len=${m.content.length}${m.content.trim() === "" ? ",EMPTY" : ""})`
+  } else if (Array.isArray(m.content)) {
+    const types = m.content.map((p: any) => p?.type ?? "?").join("+")
+    shape = `content:[${types || "EMPTY"}]`
+  } else if (m.content == null) {
+    shape = "content:null"
+  } else {
+    shape = `content:${typeof m.content}`
+  }
+  const tc =
+    Array.isArray(m.tool_calls) && m.tool_calls.length > 0
+      ? `,tool_calls=${m.tool_calls.length}`
+      : ""
+  return `${role}{${shape}${tc}}`
+}
+
+function probeTrailing(body: any): string | null {
+  if (!body || !Array.isArray(body.messages) || body.messages.length === 0) {
+    return null
+  }
+  const msgs = body.messages
+  const last = msgs[msgs.length - 1]
+  const prev = msgs.length >= 2 ? msgs[msgs.length - 2] : undefined
+  const endsWithAssistant = last?.role === "assistant"
+  return (
+    `tail: prev=${prev ? describeMsg(prev) : "-"} | last=${describeMsg(last)} | ` +
+    `PREFILL_RISK=${endsWithAssistant}`
+  )
+}
+
 // OpenAI-compatible (chat/completions) placeholder tool. The description tells
 // the model never to call it (mirrors opencode PR #18539, which steers via
 // description rather than tool_choice).
@@ -137,6 +184,11 @@ const plugin: Plugin = async (_input, options?: Record<string, unknown>) => {
                 Array.isArray(body.messages) ? body.messages.length : "?"
               })`,
             )
+          }
+          // PROBE #3 (prefill): describe trailing message shape, do NOT modify.
+          if (body && debug) {
+            const t = probeTrailing(body)
+            if (t) log(`[${providerID}] ${t}`)
           }
         }
       } catch (e) {
